@@ -1,0 +1,148 @@
+// server.js
+const express = require('express');
+const bodyParser = require('body-parser');
+const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const app = express();
+app.use(bodyParser.json());
+
+const OUTDIR = path.join(__dirname, 'jobs');
+if(!fs.existsSync(OUTDIR)) fs.mkdirSync(OUTDIR);
+
+function runCmd(cmd, opts={}) {
+  return new Promise((res, rej) => {
+    exec(cmd, { maxBuffer: 1024 * 1024 * 50, ...opts }, (err, stdout, stderr) => {
+      if(err) return rej({err, stdout, stderr});
+      res({stdout, stderr});
+    });
+  });
+}
+
+const jobs = {}; // in-memory store
+
+app.post('/api/generate', async (req, res) => {
+  try {
+    const { text, durationPerScene=4, voice='en', resolution='1280x720' } = req.body;
+    if(!text) return res.status(400).json({error:'No text'});
+
+    const jobId = uuidv4();
+    const jobDir = path.join(OUTDIR, jobId);
+    fs.mkdirSync(jobDir);
+
+    jobs[jobId] = { id: jobId, status: 'queued', progress: 0, created: Date.now(), dir: jobDir };
+
+    // Kick off async processing (don't block response)
+    process.nextTick(()=> doGenerate(jobId, text, durationPerScene, voice, resolution));
+    res.json({ jobId });
+  } catch(e) {
+    console.error(e);
+    res.status(500).json({ error: 'internal' });
+  }
+});
+
+app.get('/api/status/:id', (req, res) => {
+  const j = jobs[req.params.id];
+  if(!j) return res.status(404).json({ error:'not found' });
+  res.json({ status: j.status, progress: j.progress, videoUrl: j.videoUrl });
+});
+
+async function doGenerate(jobId, text, durationPerScene, voice, resolution){
+  const job = jobs[jobId];
+  try {
+    job.status = 'processing'; job.progress = 5;
+    const jobDir = job.dir;
+
+    // 1) split text into scenes
+    // If user writes "Scene 1:" we'll split on /^Scene\s*\d*:/i else split by blank lines.
+    let scenes = [];
+    const sceneMarkerRegex = /^Scene\s*\d*\s*:/im;
+    if(sceneMarkerRegex.test(text)) {
+      // split by lines starting with Scene
+      const lines = text.split(/\r?\n/);
+      let cur = null;
+      for(const line of lines){
+        if(/^Scene\s*\d*\s*:/i.test(line)){
+          if(cur) scenes.push(cur.trim());
+          cur = line.replace(/^Scene\s*\d*\s*:/i,'').trim();
+        } else {
+          cur = (cur? cur + ' ' : '') + line.trim();
+        }
+      }
+      if(cur) scenes.push(cur.trim());
+    } else {
+      // split by double newline
+      scenes = text.split(/\n\s*\n/).map(s=>s.trim()).filter(Boolean);
+    }
+
+    if(scenes.length === 0) scenes = [text.trim()];
+
+    job.progress = 10;
+
+    // 2) for each scene produce audio and video segment
+    const segmentFiles = [];
+    for(let i=0;i<scenes.length;i++){
+      const sceneText = scenes[i].replace(/"/g,'\\"').slice(0,300); // limit len
+      const segDur = Number(durationPerScene) || 4;
+      const segBase = path.join(jobDir, `seg_${i}`);
+      const audioFile = `${segBase}.wav`;
+      const rawVideo = `${segBase}_video.mp4`;
+      const segOut = `${segBase}_final.mp4`;
+
+      // 2.a generate TTS using espeak (install espeak on system)
+      // example: espeak -v en -w out.wav "Hello world"
+      const espeakVoice = (voice==='hi') ? 'hi' : 'en';
+      await runCmd(`espeak -v ${espeakVoice} -w "${audioFile.replace(/"/g,'\\"')}" "${sceneText.replace(/"/g,'\\"')}"`);
+      job.progress += Math.floor(60 / scenes.length / 3);
+
+      // 2.b generate simple video with background color + centered text using ffmpeg drawtext filter
+      // resolution e.g. 1280x720
+      const [w,h] = resolution.split('x');
+      // font path - try common location
+      const fontfile = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+      // if font doesn't exist, omit fontfile
+      const fontOpt = fs.existsSync(fontfile) ? `:fontfile=${fontfile}` : '';
+
+      // create a video of duration segDur with text and slow zoom (zoom via scale and crop is complex; we'll simulate with zoompan)
+      // Simpler approach: make single color video and overlay text (no zoom)
+      const drawtext = `drawtext=${fontOpt}:text='${sceneText}':fontsize=36:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.4:boxborderw=10`;
+      await runCmd(`ffmpeg -y -f lavfi -i color=size=${w}x${h}:rate=25:color=0x0a1220 -vf "${drawtext}" -t ${segDur} -c:v libx264 -pix_fmt yuv420p "${rawVideo.replace(/"/g,'\\"')}"`);
+      job.progress += Math.floor(60 / scenes.length / 3);
+
+      // 2.c combine audio + video (shortest)
+      await runCmd(`ffmpeg -y -i "${rawVideo.replace(/"/g,'\\"')}" -i "${audioFile.replace(/"/g,'\\"')}" -c:v copy -c:a aac -shortest "${segOut.replace(/"/g,'\\"')}"`);
+      job.progress += Math.floor(60 / scenes.length / 3);
+
+      segmentFiles.push(segOut);
+      job.progress = Math.min(90, job.progress);
+    }
+
+    // 3) concat segments
+    // create filelist
+    const listFile = path.join(jobDir, 'list.txt');
+    const listContent = segmentFiles.map(p => `file '${p.replace(/'/g,"'\\''")}'`).join('\n');
+    fs.writeFileSync(listFile, listContent);
+
+    const finalFile = path.join(jobDir, 'final.mp4');
+    // note: concat protocol requires same codec/format; we used libx264+aac so it should work
+    await runCmd(`ffmpeg -y -f concat -safe 0 -i "${listFile.replace(/"/g,'\\"')}" -c copy "${finalFile.replace(/"/g,'\\"')}"`);
+
+    // store video URL (serve static)
+    job.videoUrl = `/jobs/${path.basename(jobDir)}/final.mp4`;
+    job.status = 'completed';
+    job.progress = 100;
+
+    console.log('Job completed', jobId);
+  } catch(err){
+    console.error('Job error', jobId, err);
+    jobs[jobId].status = 'failed';
+    jobs[jobId].progress = 0;
+  }
+}
+
+// Serve generated files
+app.use('/jobs', express.static(path.join(__dirname,'jobs')));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, ()=> console.log('Server listening on', PORT));
